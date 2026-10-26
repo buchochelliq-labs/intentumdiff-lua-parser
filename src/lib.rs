@@ -89,7 +89,20 @@ fn is_semantic(node_type: &str) -> bool {
     SEMANTIC_TYPES.contains(&node_type)
 }
 
-fn label_for(node: &CstNode) -> String {
+fn source_span<'a>(source: &'a str, node: &CstNode) -> &'a str {
+    let Some(line) = source.lines().nth(node.start_line as usize) else {
+        return "";
+    };
+    let start = node.start_col as usize;
+    let end = if node.start_line == node.end_line {
+        node.end_col as usize
+    } else {
+        line.len()
+    };
+    line.get(start..end).unwrap_or("")
+}
+
+fn label_for(node: &CstNode, source: &str) -> String {
     if node.is_leaf() {
         return node.text_or_empty().to_string();
     }
@@ -99,9 +112,18 @@ fn label_for(node: &CstNode) -> String {
     }
     match node.node_type.as_str() {
         "function_declaration" | "local_function" => {
+            // tree-sitter-lua aliases local/global declarations to the same named
+            // node and does not expose the anonymous `local` token as a CST child.
+            // Use the declaration's source span to retain that semantic modifier.
+            let is_local = source_span(source, node).trim_start().starts_with("local function");
             for child in &node.children {
                 if child.node_type == "identifier" || child.node_type == "name" {
-                    return child.text_or_empty().to_string();
+                    let name = child.text_or_empty();
+                    return if is_local {
+                        format!("local {name}")
+                    } else {
+                        name.to_string()
+                    };
                 }
             }
         }
@@ -169,6 +191,7 @@ fn is_method_like(node_type: &str) -> bool {
 
 fn convert(
     node: &CstNode,
+    source: &str,
     id_prefix: &str,
     parent_class: Option<&str>,
     memo: &mut std::collections::HashMap<usize, String>,
@@ -183,7 +206,7 @@ fn convert(
         &is_semantic,
         &|_| false,
         &|_| false,
-        &label_for,
+        &|node| label_for(node, source),
     )
 }
 
@@ -209,7 +232,7 @@ fn process_impl(source: &str) -> String {
         Err(e) => return format!(r#"{{\"error\":\"{}\"}}"#, e),
     };
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let sem = match convert(&root, "0", None, &mut memo) {
+    let sem = match convert(&root, source, "0", None, &mut memo) {
         Some(n) => n,
         None => return r#"{"error":"Empty semantic tree"}"#.to_string(),
     };
@@ -315,6 +338,23 @@ mod tests {
         t::assert_valid_json(&out, "process(raw example)");
         assert!(!out.contains("\"error\""), "{out}");
     }
+    #[test]
+    fn local_function_modifier_changes_semantic_tree() {
+        let before = "function greet(name)\n    print(\"Hello, \" .. name)\nend\n";
+        let after = "local function greet(name)\n    print(\"Hello, \" .. name)\nend\n";
+
+        let before_tree = process_impl(before);
+        let after_tree = process_impl(after);
+
+        t::assert_valid_json(&before_tree, "global function");
+        t::assert_valid_json(&after_tree, "local function");
+        assert_ne!(before_tree, after_tree, "local modifier must be semantic");
+        assert!(
+            after_tree.contains("local greet"),
+            "local declaration identity must be retained: {after_tree}"
+        );
+    }
+
     #[test]
     fn process_impl_empty_returns_valid_json() {
         let out = process_impl("");
