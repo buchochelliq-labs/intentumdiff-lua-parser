@@ -90,14 +90,15 @@ fn is_semantic(node_type: &str) -> bool {
 }
 
 fn source_span<'a>(source: &'a str, node: &CstNode) -> &'a str {
-    if node.start_line != node.end_line {
-        return "";
-    }
     let Some(line) = source.lines().nth(node.start_line as usize) else {
         return "";
     };
     let start = node.start_col as usize;
-    let end = node.end_col as usize;
+    let end = if node.start_line == node.end_line {
+        node.end_col as usize
+    } else {
+        line.len()
+    };
     line.get(start..end).unwrap_or("")
 }
 
