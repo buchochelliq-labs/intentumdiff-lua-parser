@@ -99,9 +99,17 @@ fn label_for(node: &CstNode) -> String {
     }
     match node.node_type.as_str() {
         "function_declaration" | "local_function" => {
+            let is_local = node.children.iter().any(|child| {
+                child.node_type == "local" || child.text_or_empty() == "local"
+            });
             for child in &node.children {
                 if child.node_type == "identifier" || child.node_type == "name" {
-                    return child.text_or_empty().to_string();
+                    let name = child.text_or_empty();
+                    return if is_local {
+                        format!("local {name}")
+                    } else {
+                        name.to_string()
+                    };
                 }
             }
         }
@@ -315,6 +323,23 @@ mod tests {
         t::assert_valid_json(&out, "process(raw example)");
         assert!(!out.contains("\"error\""), "{out}");
     }
+    #[test]
+    fn local_function_modifier_changes_semantic_tree() {
+        let before = "function greet(name)\n    print(\"Hello, \" .. name)\nend\n";
+        let after = "local function greet(name)\n    print(\"Hello, \" .. name)\nend\n";
+
+        let before_tree = process_impl(before);
+        let after_tree = process_impl(after);
+
+        t::assert_valid_json(&before_tree, "global function");
+        t::assert_valid_json(&after_tree, "local function");
+        assert_ne!(before_tree, after_tree, "local modifier must be semantic");
+        assert!(
+            after_tree.contains("local greet"),
+            "local declaration identity must be retained: {after_tree}"
+        );
+    }
+
     #[test]
     fn process_impl_empty_returns_valid_json() {
         let out = process_impl("");
