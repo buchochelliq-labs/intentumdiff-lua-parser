@@ -89,7 +89,19 @@ fn is_semantic(node_type: &str) -> bool {
     SEMANTIC_TYPES.contains(&node_type)
 }
 
-fn label_for(node: &CstNode) -> String {
+fn source_span<'a>(source: &'a str, node: &CstNode) -> &'a str {
+    if node.start_line != node.end_line {
+        return "";
+    }
+    let Some(line) = source.lines().nth(node.start_line as usize) else {
+        return "";
+    };
+    let start = node.start_col as usize;
+    let end = node.end_col as usize;
+    line.get(start..end).unwrap_or("")
+}
+
+fn label_for(node: &CstNode, source: &str) -> String {
     if node.is_leaf() {
         return node.text_or_empty().to_string();
     }
@@ -99,9 +111,10 @@ fn label_for(node: &CstNode) -> String {
     }
     match node.node_type.as_str() {
         "function_declaration" | "local_function" => {
-            let is_local = node.children.iter().any(|child| {
-                child.node_type == "local" || child.text_or_empty() == "local"
-            });
+            // tree-sitter-lua aliases local/global declarations to the same named
+            // node and does not expose the anonymous `local` token as a CST child.
+            // Use the declaration's source span to retain that semantic modifier.
+            let is_local = source_span(source, node).trim_start().starts_with("local function");
             for child in &node.children {
                 if child.node_type == "identifier" || child.node_type == "name" {
                     let name = child.text_or_empty();
@@ -177,6 +190,7 @@ fn is_method_like(node_type: &str) -> bool {
 
 fn convert(
     node: &CstNode,
+    source: &str,
     id_prefix: &str,
     parent_class: Option<&str>,
     memo: &mut std::collections::HashMap<usize, String>,
@@ -191,7 +205,7 @@ fn convert(
         &is_semantic,
         &|_| false,
         &|_| false,
-        &label_for,
+        &|node| label_for(node, source),
     )
 }
 
@@ -217,7 +231,7 @@ fn process_impl(source: &str) -> String {
         Err(e) => return format!(r#"{{\"error\":\"{}\"}}"#, e),
     };
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let sem = match convert(&root, "0", None, &mut memo) {
+    let sem = match convert(&root, source, "0", None, &mut memo) {
         Some(n) => n,
         None => return r#"{"error":"Empty semantic tree"}"#.to_string(),
     };
