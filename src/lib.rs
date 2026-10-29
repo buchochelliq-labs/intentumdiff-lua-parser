@@ -52,6 +52,10 @@ const SEMANTIC_TYPES: &[&str] = &[
     "local_function",
     "function_definition",
     "method_index_expression",
+    // Required for Rust's scoped RENAME_VARIABLE promoter to recognise
+    // parameter binders; pruning the grammar's `parameters` node lets
+    // same-named identifier leaves escape their lexical signature scope.
+    "parameters",
     // Variables / assignments
     "variable_list",
     "assignment_statement",
