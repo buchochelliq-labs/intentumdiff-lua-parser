@@ -407,10 +407,69 @@ mod tests {
         t::assert_valid_json(&before_tree, "global function");
         t::assert_valid_json(&after_tree, "local function");
         assert_ne!(before_tree, after_tree, "local modifier must be semantic");
+
+        fn declaration<'a>(tree: &'a serde_json::Value, label: &str) -> Option<&'a serde_json::Value> {
+            if matches!(
+                tree.get("node_type").and_then(|v| v.as_str()),
+                Some("function_declaration" | "local_function")
+            ) && tree.get("label").and_then(|v| v.as_str()) == Some(label)
+            {
+                return Some(tree);
+            }
+            tree.get("children")
+                .and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(|child| declaration(child, label)))
+        }
+
+        let global: serde_json::Value = serde_json::from_str(&before_tree).unwrap();
+        let local: serde_json::Value = serde_json::from_str(&after_tree).unwrap();
+        let global_fn = declaration(&global, "greet").expect("global callable name");
+        let local_fn = declaration(&local, "greet").expect("local callable has SAME name");
+
+        let modifiers: Vec<&serde_json::Value> = local_fn["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|child| child["node_type"] == "declaration_modifier")
+            .collect();
+        assert_eq!(modifiers.len(), 1, "local scope must not be discarded");
+        assert_eq!(modifiers[0]["label"], "local");
+        assert_eq!(modifiers[0]["position"]["start_line"], 0);
+        assert_eq!(modifiers[0]["position"]["start_col"], 0);
+        assert_eq!(modifiers[0]["position"]["end_line"], 0);
+        assert_eq!(modifiers[0]["position"]["end_col"], 5);
         assert!(
-            after_tree.contains("local greet"),
-            "local declaration identity must be retained: {after_tree}"
+            global_fn["children"].as_array().unwrap().iter()
+                .all(|child| child["node_type"] != "declaration_modifier"),
+            "global form must not acquire local scope"
         );
+        assert_ne!(
+            global_fn["structural_hash"], local_fn["structural_hash"],
+            "scope modifier must affect semantic structural hash"
+        );
+    }
+
+    #[test]
+    fn param_rename_and_local_scope_keep_stable_callable_name() {
+        let before = process_impl("function add(a, b)\n    return a + b\nend\n");
+        let after = process_impl("local function add(x, y)\n    return x + y\nend\n");
+        t::assert_valid_json(&before, "global add");
+        t::assert_valid_json(&after, "local add with renamed parameters");
+        let old: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&after).unwrap();
+        fn callable(tree: &serde_json::Value) -> Option<&serde_json::Value> {
+            if tree["node_type"] == "function_declaration" && tree["label"] == "add" {
+                return Some(tree);
+            }
+            tree.get("children").and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(callable))
+        }
+        let old_fn = callable(&old).expect("original callable add");
+        let new_fn = callable(&new).expect("continuing callable add");
+        assert_ne!(old_fn["structural_hash"], new_fn["structural_hash"]);
+        assert!(new_fn["children"].as_array().unwrap().iter().any(
+            |child| child["node_type"] == "declaration_modifier" && child["label"] == "local"
+        ));
     }
 
     #[test]
