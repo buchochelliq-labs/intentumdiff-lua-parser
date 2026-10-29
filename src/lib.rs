@@ -476,6 +476,20 @@ mod tests {
     }
 
     #[test]
+    fn local_function_operator_only_edit_preserves_full_cst_hash_evidence() {
+        let plus = process_impl("local function add(a, b)\n    return a + b\nend\n");
+        let minus = process_impl("local function add(a, b)\n    return a - b\nend\n");
+        t::assert_valid_json(&plus, "local addition");
+        t::assert_valid_json(&minus, "local subtraction");
+        let before: serde_json::Value = serde_json::from_str(&plus).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&minus).unwrap();
+        assert_ne!(
+            before["structural_hash"], after["structural_hash"],
+            "a meaningful operator-only edit under a local declaration must not hash as style"
+        );
+    }
+
+    #[test]
     fn process_impl_empty_returns_valid_json() {
         let out = process_impl("");
         t::assert_valid_json(&out, "process(empty)");
