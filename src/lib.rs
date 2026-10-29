@@ -473,6 +473,28 @@ mod tests {
         }
         let old_fn = callable(&old).expect("original callable add");
         let new_fn = callable(&new).expect("continuing callable add");
+        fn params(tree: &serde_json::Value) -> Option<&serde_json::Value> {
+            if tree["node_type"] == "parameters" {
+                return Some(tree);
+            }
+            tree.get("children").and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(params))
+        }
+        // The Rust rename promoter requires an actual parameter-list ancestor.
+        // Matching function names alone is not enough if this CST node is pruned.
+        let old_params = params(old_fn).expect("old grammar parameters scope");
+        let new_params = params(new_fn).expect("new grammar parameters scope");
+        let identifiers = |node: &serde_json::Value| -> Vec<(String, u64)> {
+            node["children"].as_array().unwrap().iter()
+                .filter(|child| child["node_type"] == "identifier")
+                .map(|child| (
+                    child["label"].as_str().unwrap().to_owned(),
+                    child["position"]["start_col"].as_u64().unwrap()
+                ))
+                .collect()
+        };
+        assert_eq!(identifiers(old_params), vec![("a".to_owned(), 13), ("b".to_owned(), 16)]);
+        assert_eq!(identifiers(new_params), vec![("x".to_owned(), 19), ("y".to_owned(), 22)]);
         assert_ne!(old_fn["structural_hash"], new_fn["structural_hash"]);
         assert!(new_fn["children"].as_array().unwrap().iter().any(
             |child| child["node_type"] == "declaration_modifier" && child["label"] == "local"
