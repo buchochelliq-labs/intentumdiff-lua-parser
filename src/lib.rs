@@ -226,12 +226,15 @@ fn retain_local_function_modifier(node: &mut SemanticNode) -> bool {
     }
 
     if changed {
-        // The hash must include both the declared name and the complete
-        // semantic child set, including the explicit scope modifier.
+        // Keep the ORIGINAL full-CST digest in the new hash input. Computing
+        // only from pruned semantic children could erase operator/keyword
+        // changes that the CST preserved, incorrectly reporting style-only.
+        // This also incorporates the explicit scope modifier and child hashes.
+        let source_cst_hash = node.structural_hash.clone();
         node.structural_hash = SemanticNodeBuilder::new(
             node.id.clone(),
             node.node_type.clone(),
-            node.label.clone(),
+            format!("{}|source_cst_hash={source_cst_hash}", node.label),
             node.position.start_line,
             node.position.start_col,
             node.position.end_line,
