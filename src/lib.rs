@@ -554,6 +554,26 @@ mod tests {
         t::assert_valid_json(&minus, "local subtraction");
         let before: serde_json::Value = serde_json::from_str(&plus).unwrap();
         let after: serde_json::Value = serde_json::from_str(&minus).unwrap();
+        fn operators(tree: &serde_json::Value, out: &mut Vec<(String, u64, u64)>) {
+            if tree["node_type"] == "operator" {
+                out.push((
+                    tree["label"].as_str().unwrap().to_string(),
+                    tree["position"]["start_line"].as_u64().unwrap(),
+                    tree["position"]["start_col"].as_u64().unwrap(),
+                ));
+            }
+            if let Some(children) = tree.get("children").and_then(|v| v.as_array()) {
+                for child in children {
+                    operators(child, out);
+                }
+            }
+        }
+        let mut old_ops = Vec::new();
+        let mut new_ops = Vec::new();
+        operators(&before, &mut old_ops);
+        operators(&after, &mut new_ops);
+        assert_eq!(old_ops, vec![("+".to_string(), 1, 13)]);
+        assert_eq!(new_ops, vec![("-".to_string(), 1, 13)]);
         assert_ne!(
             before["structural_hash"], after["structural_hash"],
             "a meaningful operator-only edit under a local declaration must not hash as style"
