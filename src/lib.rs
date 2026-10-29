@@ -189,6 +189,62 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
+/// Separate a Lua function's declared name from its lexical `local` modifier.
+/// The grammar aliases local and global declarations to function_declaration,
+/// without exposing the anonymous modifier token as a CST child. Keeping
+/// "local add" in the function label breaks stable entity anchoring and makes
+/// scoped parameter edits look like unrelated function deletion/addition.
+/// An explicit modifier child preserves this meaningful source change with
+/// its own precise span, while the callable label remains "add".
+///
+/// Rehash affected ancestors: the synthetic child was not in the CST hashes
+/// returned by the shared converter and must not be silently style-only.
+fn retain_local_function_modifier(node: &mut SemanticNode) -> bool {
+    let mut changed = false;
+    for child in &mut node.children {
+        changed |= retain_local_function_modifier(child);
+    }
+
+    if matches!(node.node_type.as_str(), "function_declaration" | "local_function") {
+        if let Some(name) = node.label.strip_prefix("local ") {
+            let name = name.to_string();
+            let modifier = SemanticNodeBuilder::new(
+                format!("{}.{}", node.id, node.children.len()),
+                "declaration_modifier",
+                "local",
+                node.position.start_line,
+                node.position.start_col,
+                node.position.start_line,
+                node.position.start_col + 5,
+                "",
+            )
+            .build();
+            node.label = name;
+            node.children.push(modifier);
+            changed = true;
+        }
+    }
+
+    if changed {
+        // The hash must include both the declared name and the complete
+        // semantic child set, including the explicit scope modifier.
+        node.structural_hash = SemanticNodeBuilder::new(
+            node.id.clone(),
+            node.node_type.clone(),
+            node.label.clone(),
+            node.position.start_line,
+            node.position.start_col,
+            node.position.end_line,
+            node.position.end_col,
+            "",
+        )
+        .children(node.children.clone())
+        .build()
+        .structural_hash;
+    }
+    changed
+}
+
 fn convert(
     node: &CstNode,
     source: &str,
@@ -197,7 +253,7 @@ fn convert(
     memo: &mut std::collections::HashMap<usize, String>,
 ) -> Option<SemanticNode> {
     // Lua threads no class context and sets no parent_type.
-    convert_semantic_classed(
+    let mut semantic = convert_semantic_classed(
         node,
         id_prefix,
         parent_class,
@@ -207,7 +263,9 @@ fn convert(
         &|_| false,
         &|_| false,
         &|node| label_for(node, source),
-    )
+    )?;
+    retain_local_function_modifier(&mut semantic);
+    Some(semantic)
 }
 
 
