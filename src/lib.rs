@@ -283,6 +283,45 @@ fn convert(
 
 use intentumdiff_plugin_sdk::ts_convert::{convert_semantic_classed, node_to_cst};
 
+/// Retain Lua operator tokens excluded by the shared named-only CST converter.
+/// This augments its output rather than copying its general conversion rules.
+/// The source token is a semantic leaf with its true 0-based span; the original
+/// named-child positions/IDs remain unchanged across identical edit shapes.
+fn retain_lua_operator_tokens(cst: &mut CstNode, node: tree_sitter::Node<'_>, source: &[u8]) {
+    let expression = matches!(node.kind(), "binary_expression" | "unary_expression");
+    let mut named_index = 0;
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i) else {
+            continue;
+        };
+        if child.is_named() {
+            retain_lua_operator_tokens(&mut cst.children[named_index], child, source);
+            named_index += 1;
+            continue;
+        }
+        // Only genuine expression operators, never punctuation/keywords used
+        // to delimit declarations, calls or tables.
+        if expression && matches!(
+            child.kind(),
+            "+" | "-" | "*" | "/" | "//" | "%" | "^"
+                | "==" | "~=" | "<" | ">" | "<=" | ">="
+                | "and" | "or" | "not" | "#" | "~" | "&" | "|"
+                | "<<" | ">>" | ".."
+        ) {
+            cst.children.push(CstNode {
+                node_type: "operator".to_string(),
+                named: false,
+                text: Some(child.utf8_text(source).unwrap_or(child.kind()).to_string()),
+                start_line: child.start_position().row as u32,
+                start_col: child.start_position().column as u32,
+                end_line: child.end_position().row as u32,
+                end_col: child.end_position().column as u32,
+                children: Vec::new(),
+            });
+        }
+    }
+}
+
 fn parse_source(source: &str) -> Result<CstNode, String> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_lua::LANGUAGE.into();
@@ -292,7 +331,9 @@ fn parse_source(source: &str) -> Result<CstNode, String> {
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| "Parse failed".to_string())?;
-    Ok(node_to_cst(tree.root_node(), source.as_bytes()))
+    let mut cst = node_to_cst(tree.root_node(), source.as_bytes());
+    retain_lua_operator_tokens(&mut cst, tree.root_node(), source.as_bytes());
+    Ok(cst)
 }
 
 fn process_impl(source: &str) -> String {
