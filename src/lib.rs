@@ -79,6 +79,10 @@ const SEMANTIC_TYPES: &[&str] = &[
     "bracket_index_expression",
     "binary_expression",
     "unary_expression",
+    // Lua operators are ANONYMOUS tree-sitter children. The shared named-only
+    // CST converter omits them; retain explicit spanned tokens to avoid
+    // + -> - and similar behavioral changes hashing as style.
+    "operator",
     "vararg_expression",
     "table_constructor",
     "string",
