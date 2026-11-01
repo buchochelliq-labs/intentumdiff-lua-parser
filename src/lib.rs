@@ -52,6 +52,10 @@ const SEMANTIC_TYPES: &[&str] = &[
     "local_function",
     "function_definition",
     "method_index_expression",
+    // Required for Rust's scoped RENAME_VARIABLE promoter to recognise
+    // parameter binders; pruning the grammar's `parameters` node lets
+    // same-named identifier leaves escape their lexical signature scope.
+    "parameters",
     // Variables / assignments
     "variable_list",
     "assignment_statement",
@@ -75,6 +79,10 @@ const SEMANTIC_TYPES: &[&str] = &[
     "bracket_index_expression",
     "binary_expression",
     "unary_expression",
+    // Lua operators are ANONYMOUS tree-sitter children. The shared named-only
+    // CST converter omits them; retain explicit spanned tokens to avoid
+    // + -> - and similar behavioral changes hashing as style.
+    "operator",
     "vararg_expression",
     "table_constructor",
     "string",
@@ -189,6 +197,65 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
+/// Separate a Lua function's declared name from its lexical `local` modifier.
+/// The grammar aliases local and global declarations to function_declaration,
+/// without exposing the anonymous modifier token as a CST child. Keeping
+/// "local add" in the function label breaks stable entity anchoring and makes
+/// scoped parameter edits look like unrelated function deletion/addition.
+/// An explicit modifier child preserves this meaningful source change with
+/// its own precise span, while the callable label remains "add".
+///
+/// Rehash affected ancestors: the synthetic child was not in the CST hashes
+/// returned by the shared converter and must not be silently style-only.
+fn retain_local_function_modifier(node: &mut SemanticNode) -> bool {
+    let mut changed = false;
+    for child in &mut node.children {
+        changed |= retain_local_function_modifier(child);
+    }
+
+    if matches!(node.node_type.as_str(), "function_declaration" | "local_function") {
+        if let Some(name) = node.label.strip_prefix("local ") {
+            let name = name.to_string();
+            let modifier = SemanticNodeBuilder::new(
+                format!("{}.{}", node.id, node.children.len()),
+                "declaration_modifier",
+                "local",
+                node.position.start_line,
+                node.position.start_col,
+                node.position.start_line,
+                node.position.start_col + 5,
+                "",
+            )
+            .build();
+            node.label = name;
+            node.children.push(modifier);
+            changed = true;
+        }
+    }
+
+    if changed {
+        // Keep the ORIGINAL full-CST digest in the new hash input. Computing
+        // only from pruned semantic children could erase operator/keyword
+        // changes that the CST preserved, incorrectly reporting style-only.
+        // This also incorporates the explicit scope modifier and child hashes.
+        let source_cst_hash = node.structural_hash.clone();
+        node.structural_hash = SemanticNodeBuilder::new(
+            node.id.clone(),
+            node.node_type.clone(),
+            format!("{}|source_cst_hash={source_cst_hash}", node.label),
+            node.position.start_line,
+            node.position.start_col,
+            node.position.end_line,
+            node.position.end_col,
+            "",
+        )
+        .children(node.children.clone())
+        .build()
+        .structural_hash;
+    }
+    changed
+}
+
 fn convert(
     node: &CstNode,
     source: &str,
@@ -197,7 +264,7 @@ fn convert(
     memo: &mut std::collections::HashMap<usize, String>,
 ) -> Option<SemanticNode> {
     // Lua threads no class context and sets no parent_type.
-    convert_semantic_classed(
+    let mut semantic = convert_semantic_classed(
         node,
         id_prefix,
         parent_class,
@@ -207,12 +274,53 @@ fn convert(
         &|_| false,
         &|_| false,
         &|node| label_for(node, source),
-    )
+    )?;
+    retain_local_function_modifier(&mut semantic);
+    Some(semantic)
 }
 
 
 
 use intentumdiff_plugin_sdk::ts_convert::{convert_semantic_classed, node_to_cst};
+
+/// Retain Lua operator tokens excluded by the shared named-only CST converter.
+/// This augments its output rather than copying its general conversion rules.
+/// The source token is a semantic leaf with its true 0-based span; the original
+/// named-child positions/IDs remain unchanged across identical edit shapes.
+fn retain_lua_operator_tokens(cst: &mut CstNode, node: tree_sitter::Node<'_>, source: &[u8]) {
+    let expression = matches!(node.kind(), "binary_expression" | "unary_expression");
+    let mut named_index = 0;
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i) else {
+            continue;
+        };
+        if child.is_named() {
+            retain_lua_operator_tokens(&mut cst.children[named_index], child, source);
+            named_index += 1;
+            continue;
+        }
+        // Only genuine expression operators, never punctuation/keywords used
+        // to delimit declarations, calls or tables.
+        if expression && matches!(
+            child.kind(),
+            "+" | "-" | "*" | "/" | "//" | "%" | "^"
+                | "==" | "~=" | "<" | ">" | "<=" | ">="
+                | "and" | "or" | "not" | "#" | "~" | "&" | "|"
+                | "<<" | ">>" | ".."
+        ) {
+            cst.children.push(CstNode {
+                node_type: "operator".to_string(),
+                named: false,
+                text: Some(child.utf8_text(source).unwrap_or(child.kind()).to_string()),
+                start_line: child.start_position().row as u32,
+                start_col: child.start_position().column as u32,
+                end_line: child.end_position().row as u32,
+                end_col: child.end_position().column as u32,
+                children: Vec::new(),
+            });
+        }
+    }
+}
 
 fn parse_source(source: &str) -> Result<CstNode, String> {
     let mut parser = tree_sitter::Parser::new();
@@ -223,7 +331,9 @@ fn parse_source(source: &str) -> Result<CstNode, String> {
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| "Parse failed".to_string())?;
-    Ok(node_to_cst(tree.root_node(), source.as_bytes()))
+    let mut cst = node_to_cst(tree.root_node(), source.as_bytes());
+    retain_lua_operator_tokens(&mut cst, tree.root_node(), source.as_bytes());
+    Ok(cst)
 }
 
 fn process_impl(source: &str) -> String {
@@ -349,9 +459,124 @@ mod tests {
         t::assert_valid_json(&before_tree, "global function");
         t::assert_valid_json(&after_tree, "local function");
         assert_ne!(before_tree, after_tree, "local modifier must be semantic");
+
+        fn declaration<'a>(tree: &'a serde_json::Value, label: &str) -> Option<&'a serde_json::Value> {
+            if matches!(
+                tree.get("node_type").and_then(|v| v.as_str()),
+                Some("function_declaration" | "local_function")
+            ) && tree.get("label").and_then(|v| v.as_str()) == Some(label)
+            {
+                return Some(tree);
+            }
+            tree.get("children")
+                .and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(|child| declaration(child, label)))
+        }
+
+        let global: serde_json::Value = serde_json::from_str(&before_tree).unwrap();
+        let local: serde_json::Value = serde_json::from_str(&after_tree).unwrap();
+        let global_fn = declaration(&global, "greet").expect("global callable name");
+        let local_fn = declaration(&local, "greet").expect("local callable has SAME name");
+
+        let modifiers: Vec<&serde_json::Value> = local_fn["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|child| child["node_type"] == "declaration_modifier")
+            .collect();
+        assert_eq!(modifiers.len(), 1, "local scope must not be discarded");
+        assert_eq!(modifiers[0]["label"], "local");
+        assert_eq!(modifiers[0]["position"]["start_line"], 0);
+        assert_eq!(modifiers[0]["position"]["start_col"], 0);
+        assert_eq!(modifiers[0]["position"]["end_line"], 0);
+        assert_eq!(modifiers[0]["position"]["end_col"], 5);
         assert!(
-            after_tree.contains("local greet"),
-            "local declaration identity must be retained: {after_tree}"
+            global_fn["children"].as_array().unwrap().iter()
+                .all(|child| child["node_type"] != "declaration_modifier"),
+            "global form must not acquire local scope"
+        );
+        assert_ne!(
+            global_fn["structural_hash"], local_fn["structural_hash"],
+            "scope modifier must affect semantic structural hash"
+        );
+    }
+
+    #[test]
+    fn param_rename_and_local_scope_keep_stable_callable_name() {
+        let before = process_impl("function add(a, b)\n    return a + b\nend\n");
+        let after = process_impl("local function add(x, y)\n    return x + y\nend\n");
+        t::assert_valid_json(&before, "global add");
+        t::assert_valid_json(&after, "local add with renamed parameters");
+        let old: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&after).unwrap();
+        fn callable(tree: &serde_json::Value) -> Option<&serde_json::Value> {
+            if tree["node_type"] == "function_declaration" && tree["label"] == "add" {
+                return Some(tree);
+            }
+            tree.get("children").and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(callable))
+        }
+        let old_fn = callable(&old).expect("original callable add");
+        let new_fn = callable(&new).expect("continuing callable add");
+        fn params(tree: &serde_json::Value) -> Option<&serde_json::Value> {
+            if tree["node_type"] == "parameters" {
+                return Some(tree);
+            }
+            tree.get("children").and_then(|v| v.as_array())
+                .and_then(|children| children.iter().find_map(params))
+        }
+        // The Rust rename promoter requires an actual parameter-list ancestor.
+        // Matching function names alone is not enough if this CST node is pruned.
+        let old_params = params(old_fn).expect("old grammar parameters scope");
+        let new_params = params(new_fn).expect("new grammar parameters scope");
+        let identifiers = |node: &serde_json::Value| -> Vec<(String, u64)> {
+            node["children"].as_array().unwrap().iter()
+                .filter(|child| child["node_type"] == "identifier")
+                .map(|child| (
+                    child["label"].as_str().unwrap().to_owned(),
+                    child["position"]["start_col"].as_u64().unwrap()
+                ))
+                .collect()
+        };
+        assert_eq!(identifiers(old_params), vec![("a".to_owned(), 13), ("b".to_owned(), 16)]);
+        assert_eq!(identifiers(new_params), vec![("x".to_owned(), 19), ("y".to_owned(), 22)]);
+        assert_ne!(old_fn["structural_hash"], new_fn["structural_hash"]);
+        assert!(new_fn["children"].as_array().unwrap().iter().any(
+            |child| child["node_type"] == "declaration_modifier" && child["label"] == "local"
+        ));
+    }
+
+    #[test]
+    fn local_function_operator_only_edit_preserves_full_cst_hash_evidence() {
+        let plus = process_impl("local function add(a, b)\n    return a + b\nend\n");
+        let minus = process_impl("local function add(a, b)\n    return a - b\nend\n");
+        t::assert_valid_json(&plus, "local addition");
+        t::assert_valid_json(&minus, "local subtraction");
+        let before: serde_json::Value = serde_json::from_str(&plus).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&minus).unwrap();
+        fn operators(tree: &serde_json::Value, out: &mut Vec<(String, u64, u64)>) {
+            if tree["node_type"] == "operator" {
+                out.push((
+                    tree["label"].as_str().unwrap().to_string(),
+                    tree["position"]["start_line"].as_u64().unwrap(),
+                    tree["position"]["start_col"].as_u64().unwrap(),
+                ));
+            }
+            if let Some(children) = tree.get("children").and_then(|v| v.as_array()) {
+                for child in children {
+                    operators(child, out);
+                }
+            }
+        }
+        let mut old_ops = Vec::new();
+        let mut new_ops = Vec::new();
+        operators(&before, &mut old_ops);
+        operators(&after, &mut new_ops);
+        assert_eq!(old_ops, vec![("+".to_string(), 1, 13)]);
+        assert_eq!(new_ops, vec![("-".to_string(), 1, 13)]);
+        assert_ne!(
+            before["structural_hash"], after["structural_hash"],
+            "a meaningful operator-only edit under a local declaration must not hash as style"
         );
     }
 
